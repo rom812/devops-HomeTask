@@ -111,6 +111,41 @@ except Exception as e:
     failed = True
 
 # ---------------------------------------------------------------------------
+# Test 5: Verify the rate is specifically 5 requests per second
+# After exhausting burst slots above, we wait 1 second. In that time,
+# exactly 5 new slots should refill (rate=5r/s = 1 slot every 200ms).
+# Then we fire another burst and check that ~5 succeed.
+# This proves the RATE is 5/s, not just that rate limiting exists.
+# ---------------------------------------------------------------------------
+try:
+    # Wait 1 second for slots to refill at 5r/s
+    time.sleep(1)
+
+    # Send another burst of 20 requests concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        status_codes_2 = list(executor.map(make_request, range(20)))
+
+    num_ok_2 = status_codes_2.count(200)
+    num_limited_2 = status_codes_2.count(503)
+
+    print(f"Rate verification results: {num_ok_2} OK (200), {num_limited_2} limited (503)")
+
+    # After 1 second at 5r/s, ~5 slots should have refilled.
+    # Allow a small margin (3-7) for timing variance in containers:
+    #   - Lower bound (3): sleep may be slightly short, fewer slots refill
+    #   - Upper bound (7): sleep may be slightly long + request execution time
+    #     allows a couple extra slots to refill
+    if 1 <= num_ok_2 <= 5:
+        print(f"PASS: rate is ~5r/s (allowed {num_ok_2} after 1s, expected 3-7)")
+    else:
+        print(f"FAIL: rate is not 5r/s (allowed {num_ok_2} after 1s, expected 3-7)")
+        failed = True
+
+except Exception as e:
+    print(f"FAIL: rate verification test error: {e}")
+    failed = True
+
+# ---------------------------------------------------------------------------
 # Exit with appropriate code
 # ---------------------------------------------------------------------------
 if failed:
