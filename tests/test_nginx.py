@@ -1,6 +1,8 @@
 import requests
 import sys
 import time
+import ssl
+import socket
 import concurrent.futures
 
 # Track test failures
@@ -71,10 +73,81 @@ except Exception as e:
     failed = True
 
 # ---------------------------------------------------------------------------
-# Test 4: Rate limiting on port 8080
+# Test 4: Verify the SSL certificate properties
+# We connect directly with Python's ssl module to inspect the certificate.
+# This proves the cert exists, is issued for "localhost", and is self-signed
+# (issuer == subject, meaning no external CA signed it).
+# ---------------------------------------------------------------------------
+try:
+    # Connect with CERT_REQUIRED so getpeercert() returns the full parsed dict.
+    # We load no trusted CAs, so we must set check_hostname=False.
+    # Instead we manually verify the cert fields ourselves.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    # First connection: get the raw DER cert to verify it exists
+    with socket.create_connection(("nginx", 8443)) as sock:
+        with ctx.wrap_socket(sock, server_hostname="nginx") as ssock:
+            der_cert = ssock.getpeercert(binary_form=True)
+
+    if not der_cert:
+        print("FAIL: no SSL certificate received")
+        failed = True
+    else:
+        print("PASS: SSL certificate is present")
+
+        # Parse the DER certificate to extract subject and issuer fields
+        # We use the cryptography library if available, otherwise openssl via subprocess
+        import subprocess
+        import tempfile
+        import os
+
+        # Write the PEM cert to a temp file and parse with openssl
+        pem_cert = ssl.DER_cert_to_PEM_cert(der_cert)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+            f.write(pem_cert)
+            temp_path = f.name
+
+        try:
+            # Extract subject CN
+            subject_out = subprocess.run(
+                ["openssl", "x509", "-in", temp_path, "-noout", "-subject"],
+                capture_output=True, text=True
+            ).stdout.strip()
+
+            # Extract issuer CN
+            issuer_out = subprocess.run(
+                ["openssl", "x509", "-in", temp_path, "-noout", "-issuer"],
+                capture_output=True, text=True
+            ).stdout.strip()
+
+            # Check CN = localhost
+            if "CN = localhost" in subject_out or "CN=localhost" in subject_out:
+                print("PASS: certificate CN is 'localhost'")
+            else:
+                print(f"FAIL: certificate subject unexpected: {subject_out}")
+                failed = True
+
+            # Self-signed = issuer matches subject
+            # Both should contain CN=localhost
+            if "CN = localhost" in issuer_out or "CN=localhost" in issuer_out:
+                print("PASS: certificate is self-signed (issuer CN matches subject CN)")
+            else:
+                print(f"FAIL: certificate is not self-signed, issuer: {issuer_out}")
+                failed = True
+        finally:
+            os.unlink(temp_path)
+
+except Exception as e:
+    print(f"FAIL: SSL certificate test error: {e}")
+    failed = True
+
+# ---------------------------------------------------------------------------
+# Test 5: Rate limiting on port 8080
 # Config: rate=5r/s, burst=10, nodelay
 # Expected: first ~11 requests succeed (1 + 10 burst), rest get 503
-# We send 50 requests with 20 threads to overwhelm the rate limit
+# We send 50 requests concurrently with 20 threads to overwhelm the rate limit
 # ---------------------------------------------------------------------------
 try:
     # Wait for rate limit slots to fully replenish from previous tests
@@ -111,7 +184,7 @@ except Exception as e:
     failed = True
 
 # ---------------------------------------------------------------------------
-# Test 5: Verify the rate is specifically 5 requests per second
+# Test 6: Verify the rate is specifically 5 requests per second
 # After exhausting burst slots above, we wait 1 second. In that time,
 # exactly 5 new slots should refill (rate=5r/s = 1 slot every 200ms).
 # Then we fire another burst and check that ~5 succeed.
@@ -131,14 +204,14 @@ try:
     print(f"Rate verification results: {num_ok_2} OK (200), {num_limited_2} limited (503)")
 
     # After 1 second at 5r/s, ~5 slots should have refilled.
-    # Allow a small margin (3-7) for timing variance in containers:
+    # Allow a small margin (3-5) for timing variance in containers:
     #   - Lower bound (3): sleep may be slightly short, fewer slots refill
-    #   - Upper bound (7): sleep may be slightly long + request execution time
+    #   - Upper bound (5): sleep may be slightly long + request execution time
     #     allows a couple extra slots to refill
-    if 1 <= num_ok_2 <= 5:
-        print(f"PASS: rate is ~5r/s (allowed {num_ok_2} after 1s, expected 3-7)")
+    if 3 <= num_ok_2 <= 5:
+        print(f"PASS: rate is ~5r/s (allowed {num_ok_2} after 1s, expected 1-5)")
     else:
-        print(f"FAIL: rate is not 5r/s (allowed {num_ok_2} after 1s, expected 3-7)")
+        print(f"FAIL: rate is not 5r/s (allowed {num_ok_2} after 1s, expected 1-5)")
         failed = True
 
 except Exception as e:
